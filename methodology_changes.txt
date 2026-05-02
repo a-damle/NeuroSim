@@ -1,0 +1,261 @@
+METHODOLOGY CHANGES FROM PROPOSAL
+===================================
+
+This document tracks all changes from the original proposal for reference
+when writing the final paper.
+
+
+1. ALGORITHM CHANGE: IRGM → Unpreconditioned GMRES
+----------------------------------------------------
+Proposal: LU-preconditioned GMRES (IRGM) from Haidar et al.
+Final:    Unpreconditioned GMRES with diagonal preconditioner from Le Gallo et al.
+
+Reason: CIM arrays are weight-stationary — one operand is programmed into the
+memory array and stays fixed. In IRGM, the LU factorization requires updating
+the array at every factorization step (O(n/nb) reprogramming cycles), which is
+expensive and impractical on real hardware. Le Gallo's approach only requires
+programming A once (or A_tilde = M^{-1}A - I once), and all subsequent
+operations are reads.
+
+Reference: Le Gallo et al., "Mixed-Precision In-Memory Computing," 2018,
+Algorithm 2 (GMRES variant).
+
+
+2. PRECONDITIONING STRATEGY
+-----------------------------
+Proposal: Did not discuss preconditioning in detail.
+Final:    Two modes depending on matrix type:
+  - Symmetric matrices (types 1, 2, 3, 5): Diagonal preconditioner M = diag(A).
+    CIM array stores A_tilde = M^{-1}A - I. The identity component is added
+    digitally to avoid CIM noise on the dominant diagonal entries.
+  - Non-symmetric matrices (types 4, 6): No preconditioner (M = I).
+    CIM array stores A directly. Diagonal preconditioner fails because diag(A)
+    can have near-zero entries for non-symmetric matrices (A = UΣVᵀ with U ≠ V).
+
+This distinction affects what is physically programmed into the CIM array.
+
+
+3. NON-SYMMETRIC MATRICES (TYPES 4, 6)
+-----------------------------------------
+Proposal: Evaluate all 6 matrix types from Haidar et al. Table II.
+Final:    Types 4 and 6 are included as FP64 baselines only, not in the
+          quantized/CIM sweeps.
+
+Reason: Without LU preconditioning, unpreconditioned GMRES on non-symmetric
+matrices requires inner_iters ≈ n (full GMRES budget) to converge. At n=500,
+this means 500 CIM matmuls per outer iteration — eliminating the efficiency
+advantage of CIM. This is discussed as a limitation and motivation for
+future work on CIM-compatible preconditioners (block diagonal, polynomial).
+
+
+4. MATRIX SIZE
+---------------
+Proposal: 4K × 4K matrices.
+Final:    500 × 500 matrices.
+
+Reason: Simulation overhead. NeuroSim runs are expensive and the quantization
+sweep involves hundreds of configurations. Convergence behavior (which
+precisions converge, which don't) is expected to be similar at both sizes.
+
+
+5. TEST MATRICES
+-----------------
+Proposal: Same 6 synthetic matrix types from Haidar et al. Table II.
+Final:    Same, but note that these are harder than what Le Gallo tested.
+          Le Gallo used well-conditioned covariance matrices where the diagonal
+          preconditioner works very well. Using Haidar's matrices probes the
+          limits of the approach beyond the original Le Gallo paper.
+
+Justification for paper: Haidar's matrices span a wider range of difficulty
+and applications than Le Gallo's covariance matrices.
+
+
+6. EXPERIMENT 0: INDEPENDENT PRECISION SWEEP
+----------------------------------------------
+Proposal: Sweep integer bit-width from 16 to 4 bits (single parameter).
+Final:    Sweep weight_bits and input_bits independently, each from
+          {4, 6, 8, 10, 12, 16}. This matches the independent weight/input
+          precision parameters in Table I and reveals whether the precision
+          floor is driven more by the weight operand (stationary in array)
+          or the input operand (streamed through).
+
+
+7. QUANTIZATION SCHEME
+------------------------
+Proposal: Did not specify quantization details.
+Final:    Matches NeuroSim's TensorQuantizer exactly:
+  - Signed symmetric, narrow range (e.g., [-127, 127] for 8-bit)
+  - Weight operand (A_tilde): per-row quantization (one scale per row)
+  - Input operand (v):        per-tensor quantization (one scale for all)
+
+
+8. CIM MATMUL AS PLUGGABLE FUNCTION
+--------------------------------------
+Proposal: Replace low-precision computations with simulated ACIM.
+Final:    Solver accepts a pluggable matmul_fn(W, v) → w. Three variants:
+  - Experiment 0: acim_matmul (quantization noise only, no analog effects)
+  - Experiment 1: NeuroSim CIMLinear (quantization + analog noise)
+  - Experiment 2: Same as Exp 1, with PPA traces for energy estimation
+  This design means the same solver code is used for all three experiments.
+
+
+9. INNER GMRES ITERATIONS (m)
+-------------------------------
+Proposal: Did not specify.
+Final:    m = 30 for symmetric types (1, 2, 3, 5) with diagonal preconditioner.
+          m = 500 (= n) for non-symmetric types (4, 6) without preconditioner.
+
+Le Gallo used m = 5 for n = 500 and m = 10 for n = 5000, but their matrices
+were much easier (well-conditioned covariance matrices).
+
+
+10. CONVERGENCE TOLERANCE
+---------------------------
+Proposal: "Until the residual is sufficiently small."
+Final:    tol = 1e-12 on ||r||_2, max 200 outer iterations.
+
+
+11. NEUROSIM BUGS FIXED
+--------------------------
+Three bugs in NeuroSim v1.5-dev hook.py (PPA trace generation):
+  1. self.batch_size → self._cim_args.batch_size
+  2. self.name → self._cim_args.name
+  3. dec2val called with 3 args instead of 5
+
+Additional issue: hook.py pre-encoded data (dec2bin/dec2val) but the v1.5 C++
+backend does its own encoding. Fixed to write raw floats for weights and raw
+integers for inputs. Input orientation also fixed (needs one row per input
+element, not one row per vector).
+
+
+12. EXPERIMENTS 1-2: CIM SWEEP CONFIGURATIONS
+------------------------------------------------
+Proposal: Sweep {6, 8, 10} × {6, 8, 10} × {32, 64, 128} for all matrix types.
+Final:    Sweep ranges vary per matrix type, selected based on experiment 0 results.
+
+Methodology for selecting configs: For each matrix type, we identified the
+smallest contiguous block of (weight_bits, input_bits) combinations where
+every pair in the block converged under ideal quantization (no analog noise).
+Configurations that diverged at ideal quantization will only perform worse
+with additional analog noise from CIM, so they are excluded.
+
+  Type 1 (diag dominant):      w ∈ {4, 6, 8},  i ∈ {4, 6, 8}    → 9 combos
+  Type 2 (log-uniform σ, +λ):  w ∈ {12, 16},   i ∈ {10, 12, 16}  → 6 combos
+  Type 3 (clustered σ, +λ):    w ∈ {10, 12, 16}, i ∈ {10, 12, 16} → 9 combos
+  Type 5 (arithmetic σ, +λ):   w ∈ {8, 10, 12}, i ∈ {10, 12, 16}  → 9 combos
+  Types 4, 6 (non-symmetric):  excluded (see item 3)
+
+Note: Type 1 uses precisions BELOW the original Table I range ({6, 8, 10})
+because experiment 0 showed convergence down to 4-bit — this is extended
+to capture the full viable range for diag-dominant matrices.
+
+Each precision combo is crossed with:
+  - Row parallelism: {32, 64, 128} (from Table I)
+  - Device type: SRAM, RRAM (from Table I)
+
+Total: 33 precision combos × 3 parallelism × 2 devices = 198 NeuroSim PPA runs.
+
+However, row parallelism and device type affect both PPA and analog noise.
+With realistic noise parameters enabled (item 14), different row parallelism
+values may produce different convergence behavior (more parallel rows →
+more accumulated noise per ADC read). Each (precision, parallelism, device)
+combination requires its own solver run.
+
+Experiments 1 and 2 are the same experiment presented two ways:
+  - Experiment 1: convergence curves (residual vs iteration)
+  - Experiment 2: Pareto frontier (total CIM energy vs total iterations)
+Total CIM energy = (outer_iters × inner_iters) × energy_per_matmul.
+
+
+13. NEUROSIM BUG: write_layer NOT IMPORTED IN macro.py
+--------------------------------------------------------
+In addition to the hook.py bugs (item 11), macro.py calls write_layer()
+on line 26 of simulate_array but never imports it. Fix: add
+    from pytorch_quantization.utils.hook import write_layer
+to the top of macro.py. This is the fifth NeuroSim v1.5-dev bug found.
+
+
+14. ACIM DEVICE PARAMETERS AND NOISE MODELING
+------------------------------------------------
+Proposal: Used NeuroSim default configurations as representative baselines.
+Final:    Device parameters updated to use published silicon measurements.
+          NeuroSim defaults all noise to zero; realistic values were sourced
+          from published characterization papers at the nearest available nodes.
+
+Methodology: Parameters were taken directly from published silicon measurements
+without extrapolation or scaling. Where a single source did not provide all
+three noise parameters, values were composed from multiple papers at comparable
+process nodes. This mix-and-match approach is documented below with per-parameter
+sourcing.
+
+RRAM Parameters (Intel 22nm FinFET ReRAM):
+  Device:  Ron = 3kΩ (G_LRS = 3.33e-4 S), Roff = 40kΩ (G_HRS = 2.5e-5 S),
+           on/off ratio ≈ 13, 1-bit/cell.
+  Source:  Read et al., "NeuroSim V1.5," 2026, Table I — published default
+           Intel 22nm RRAM configuration used by the NeuroSim authors.
+
+  (1) Read noise (σ_read = 0.05, relative fraction of conductance per read):
+      Applied as conductance * (1 + N(0, 0.05)) per read cycle.
+      Source: Chen et al., "NeuroSim: A Circuit-Level Macro Model," IEEE TCAD
+      2018 — inference accuracy degrades above 15-25% σ. 5% chosen as
+      conservative value below this threshold. No direct C2C measurement
+      exists for the Intel 22nm device.
+
+  (2) D2D variation (stored in mem_states_rram.csv):
+      LRS: mean = 3.33e-4 S, std = 3.33e-5 S (10% of G_LRS)
+      HRS: mean = 2.5e-5 S,  std = 5.0e-6 S  (20% of G_HRS)
+      Source: Read et al. 2026, Fig. 6 — sweeps D2D from 1-40% LRS, shows
+      ResNet-50 accuracy degrades sharply above 5% LRS. 10% chosen as
+      moderately stressed but realistic. HRS set higher following the
+      asymmetric convention in V1.5 Fig. 6. No direct post-programming
+      distribution published for Intel 22nm due to NDA.
+
+  (3) ADC output noise (σ_ADC = 0.28 counts on 7-bit [0-127] scale):
+      Source: Li et al., "A 40nm MLC-RRAM CIM Macro," IEEE JSSC vol. 57,
+      Sep. 2022 — directly reported silicon measurement. Cited in Read et al.
+      2026 as ref [7], reported in V1.5 Fig. 9. Noted limitation: measurement
+      at 8 activated rows vs our 128, 3-bit ADC vs 7-bit, 40nm vs 22nm.
+
+SRAM Parameters (22nm FD-SOI charge-domain CIM):
+  Device:  6T/8T SRAM, 1-bit/cell. Digital bit storage, analog computation
+           via simultaneous wordline activation.
+  Source:  Kneip et al., "IMAGINE: An 8-to-1b 22nm FD-SOI CIM Accelerator,"
+           IEEE TCAS-AI vol. 2, Sep. 2025. Cited as ref [47] in Read et al.
+           2026. Values represent charge-domain lower bound; current-domain
+           6T/8T designs exhibit higher noise.
+
+  (1) Read noise (σ_read = 0.01, relative):
+      Source: Kneip et al. 2025, §III.B — kT/Cc thermal noise on 0.7fF MoM
+      capacitor = 2.4mV, below 8-bit LSB (3.125mV). No filament stochasticity;
+      noise is thermal only. Order of magnitude lower than RRAM.
+
+  (2) D2D variation (σ = 0 for both states):
+      SRAM stores digital bits via cross-coupled inverters at voltage rails.
+      No analog programming step, therefore no cell-to-cell conductance scatter.
+      Transistor Vth mismatch manifests during readout and is captured in σ_ADC.
+
+  (3) ADC output noise (σ_ADC = 0.26 counts, charge-domain lower bound):
+      Source: Kneip et al. 2025, §V.A — measured max RMS = 0.52 LSB at 8-bit,
+      128 rows. Divided by 2 for 7-bit conversion. Current-domain 6T/8T designs
+      show 0.4-1.1 counts (7-bit equivalent) per same paper's comparison table.
+
+Note: Previous experiment 1-2 run (exp12_rram_results.pt) used all-zero noise
+parameters (NeuroSim defaults), so convergence results were equivalent to
+experiment 0 with only quantization + ADC pipeline effects. Re-run required
+with these realistic noise values.
+
+
+15. RRAM DEVICE PARAMETERS IN cim_args
+-----------------------------------------
+Proposal: Used NeuroSim defaults (off_state=6e-3, on_state=6e-3*17, on/off=17).
+Final:    Updated to Intel 22nm values (off_state=2.5e-5, on_state=3.33e-4,
+          on/off≈13) to match the device characterization in Read et al. 2026.
+
+
+16. POTENTIAL FUTURE ADDITIONS (if needed)
+--------------------------------------------
+- Device averaging (Le Gallo's K parameter): store each matrix element in K
+  devices and average reads. Trades area for precision. May be needed if
+  NeuroSim analog noise is too severe for convergence.
+- CIM-compatible preconditioners: block diagonal or polynomial preconditioners
+  as middle ground between weak diagonal and expensive LU.

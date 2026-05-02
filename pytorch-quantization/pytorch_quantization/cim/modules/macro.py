@@ -2,6 +2,7 @@ import torch
 import math
 import numpy as np
 import os
+from pytorch_quantization.utils.hook import write_layer
 class CIM():
     def simulate_array(self, input2d, weight2d):
 

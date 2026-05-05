@@ -1,0 +1,302 @@
+ECE595 TERM PROJECT — CONTEXT FILE
+====================================
+Course: ECE595, Purdue University
+Group 8: Abhishek Damle + Denny Ng
+Due: Next week (finals week)
+Status: All data collected, need final figures and paper
+
+
+PROJECT OVERVIEW
+=================
+Exploring whether analog compute-in-memory (ACIM) can replace low-precision
+digital hardware in mixed-precision iterative refinement solvers for Ax=b.
+Uses NeuroSim v1.5 for CIM simulation.
+
+
+REFERENCE PAPERS
+==================
+1. Haidar et al. (SC18) — LU-preconditioned IRGM on GPU tensor cores.
+   Source of the 6 test matrix types (Table II).
+
+2. Le Gallo et al. (2018) — Unpreconditioned Krylov solver with PCM hardware.
+   Source of the algorithm we implemented (Algorithm 2, GMRES variant).
+   Used K-device averaging. tol=1e-5 (main), tol=1e-3 (relaxed).
+
+3. PETRA (Cho et al., VLSI 2021) — 22nm FinFET FP16 accelerator.
+   Source of FP16 baseline cost model. Measured silicon.
+
+
+ALGORITHM
+==========
+Mixed-precision iterative refinement with unpreconditioned GMRES:
+  - Outer loop (FP64): r = b - Ax, x = x + z
+  - Inner loop: GMRES with m=30 inner iterations
+  - CIM operation: A_tilde @ v (weight-stationary, programmed once)
+  - Preconditioner: M = diag(A) for symmetric types (1,2,3,5)
+  - Stationary matrix: A_tilde = M^{-1}A - I
+
+Why not Haidar's LU-preconditioned approach: CIM is weight-stationary.
+LU factorization requires reprogramming the array at every step.
+
+Why not Le Gallo's matrices: We use Haidar's 6 types because they span
+a wider range of difficulties. Le Gallo only tested easy covariance matrices.
+
+
+MATRIX TYPES (Haidar Table II, n=500, cond=1e4)
+=================================================
+Type 1: Diag dominant (symmetric) — EASY, all configs converge
+Type 2: Log-uniform σ, positive λ (symmetric) — HARD, mostly doesn't converge
+Type 3: Clustered σ, positive λ (symmetric) — MODERATE, converges at high K
+Type 4: Clustered σ, general eigenvalues (non-symmetric) — EXCLUDED (needs m=n)
+Type 5: Arithmetic σ, positive λ (symmetric) — HARD, mostly doesn't converge
+Type 6: Arithmetic σ, general eigenvalues (non-symmetric) — EXCLUDED (needs m=n)
+
+Types 4,6 excluded because unpreconditioned GMRES needs m=n=500 inner
+iterations, which eliminates the CIM efficiency advantage (500 CIM matmuls
+per outer iteration vs ~30 for symmetric types).
+
+
+NEUROSIM v1.5 BUGS FOUND (7 total)
+=====================================
+1. hook.py: self.batch_size → self._cim_args.batch_size
+2. hook.py: self.name → self._cim_args.name
+3. hook.py: dec2val called with 3 args instead of 5
+4. hook.py: Data pre-encoded but v1.5 C++ does its own encoding.
+   Fixed to write raw floats for weights, raw integers for inputs.
+   Input orientation also fixed (rows=in_features, not rows=num_vectors).
+5. macro.py: write_layer called but never imported. Fix: add
+   from pytorch_quantization.utils.hook import write_layer
+6. macro.py: conductance_sampling can produce negative conductances via
+   Gaussian sampling, crashing read_noise (negative std). Fix: clamp to min=0.
+7. macro.py: output_noise > 0 bypasses entire analog simulation (read noise,
+   D2D, conductance, drift). Two code paths are mutually exclusive but
+   undocumented. Fix: set output_noise=0.0 to use analog path.
+
+
+CIM NOISE PARAMETERS (RRAM only — SRAM dropped, see methodology)
+===================================================================
+RRAM (Intel 22nm FinFET ReRAM):
+  Ron=3kΩ, Roff=40kΩ, on/off≈13
+  read_noise=0.05 (5% relative, per-read) — Chen et al. TCAD 2018
+  D2D: LRS std=3.33e-5 S (10%), HRS std=5.0e-6 S (20%) — Read et al. 2026 Fig.6
+  output_noise=0.0 (ADC noise from analog sensing model, not explicit injection)
+  mem_states file: mem_states_rram.csv
+
+
+EXPERIMENTS AND RESULTS
+========================
+
+EXPERIMENT 0 (ideal quantization, no analog noise):
+  Sweeps w_bits × i_bits ∈ {4,6,8,10,12,16}² for ALL 6 types.
+  Results: exp0_results_light.pt (baselines stripped of A and x_ref to reduce size)
+  Key format: (mtype, wb, ib)
+
+  Convergence summary:
+    Type 1: 36/36 converged, min precision 4-bit (all configs work)
+    Type 2: 6/36 converged, needs w≥12, i≥10
+    Type 3: 10/36 converged, needs w≥10, i≥8 (with gaps — non-monotonic)
+    Type 4: 14/36 converged, needs w≥10, i≥6 — BUT requires m=500 (=n)
+    Type 5: 12/36 converged, needs w≥8, i≥10
+    Type 6: 13/36 converged, needs w≥10, i≥8 — BUT requires m=500 (=n)
+
+  Types 4,6 excluded from CIM sweeps: they converge at higher precisions but
+  require m=n=500 inner iterations (17× more CIM matmuls per outer iteration
+  than symmetric types with m=30), eliminating the CIM efficiency advantage.
+
+  Used to select CIM sweep configs — smallest contiguous converging block:
+    Type 1: w∈{4,6,8}, i∈{4,6,8} → 9 combos
+    Type 2: w∈{12,16}, i∈{10,12,16} → 6 combos
+    Type 3: w∈{10,12,16}, i∈{10,12,16} → 9 combos
+    Type 5: w∈{8,10,12}, i∈{10,12,16} → 9 combos
+
+EXPERIMENT 1-2 RRAM (CIM with analog noise):
+  PREVIOUS RESULTS INVALID: used output_noise=0.28 which triggered
+  NeuroSim's digital shortcut, bypassing all analog physics (read noise,
+  D2D, conductance). Re-running with output_noise=0.0 for full analog path.
+
+  Final sweep: 162 configs (types 1,3 only)
+    Type 1: 9 precision × 3 parallelism × 3 K = 81 configs
+    Type 3: 9 precision × 3 parallelism × 3 K = 81 configs
+  Results: exp12_rram_results.pt (to be regenerated)
+  Key format: (mtype, wb, ib, pr, K)
+
+SRAM DROPPED:
+  NeuroSim's analog path models resistive memory (I=VG). SRAM CIM uses
+  different physics (charge-domain Q=CV or current-domain gating).
+  NeuroSim authors acknowledge: "we have not fully incorporated more
+  intricate simulations to account for the unique non-idealities found
+  in analog SRAM mode" (Read et al. 2026).
+  Previous SRAM results used digital shortcut and are not physically grounded.
+
+FP16 BASELINE:
+  Results: fp16_baseline_results.pt (NEEDS TO BE RUN)
+  Key format: mtype (int)
+  Uses torch.float16 casting (NOT integer quantization).
+  PETRA cost model (22nm FinFET, measured silicon):
+    Nominal 0.88V: 0.89 pJ/MAC → 222 nJ/MVM, 0.348 µs/MVM
+    Peak eff 0.70V: 0.29 pJ/MAC → 71.7 nJ/MVM, 0.587 µs/MVM
+  500×500 MVM = 250,000 MACs
+
+  FP64 baseline for Type 1: 2 iters → PETRA 0.70V: 4.3µJ, 35.2µs
+  CIM best (Type 1): ~0.06µJ, ~107µs — ~70× energy advantage, ~3× latency penalty
+
+
+K-DEVICE AVERAGING
+====================
+K∈{1,4,8}. Sequential forward passes (not tiled).
+Tiled approach tested but rejected — shared reference column in
+simulate_array causes correlated noise across tiles.
+
+PPA scaling: K× energy, same latency, K× area.
+
+Key finding: K=8 drops Type 3 residual by 5 orders of magnitude
+(1e-1 → 1e-6 for RRAM, 1e-1 → 1e-9 for SRAM) but cannot rescue
+Types 2,5.
+
+
+EARLY STOPPING
+===============
+Only divergence detection: stop if residual > 100× initial residual.
+Stagnation detection was removed — noisy CIM residuals oscillate but
+trend downward, and premature stopping was cutting off runs that would
+eventually converge.
+
+Convergence threshold for Pareto: Le Gallo's tol=1e-5 (main) and
+tol=1e-3 (relaxed). Applied post-hoc from convergence histories —
+pick first iteration crossing threshold, compute total cost to that point.
+
+
+.pt FILE FORMATS
+==================
+All portable — just need PyTorch, no NeuroSim. Use map_location='cpu'.
+
+exp0_results_light.pt:
+  {"results": {(mtype,wb,ib): {"history":[], "iters":N, "final_residual":F,
+   "rel_error":F, "converged":bool}},
+   "baselines": {mtype: {"history":[], "iters":N}},
+   "config": {...}}
+  Note: baselines stripped of A and x_ref tensors to reduce file size.
+  Matrices are deterministic via TestMatrixGenerator(500, seed=42).
+
+exp12_{device}_results.pt:
+  {"results": {(mtype,wb,ib,pr,K): {"history":[], "iters":N,
+   "final_residual":F, "rel_error":F, "converged":bool, "stop_reason":str,
+   "total_matmuls":N, "K":N, "ppa_single":{"energy_pJ":F, "latency_ns":F,
+   "area_um2":F, "tops_per_w":F}, "total_energy_pJ":F, "total_latency_ns":F,
+   "total_area_um2":F}},
+   "baselines": {mtype: {"history":[], ...}},
+   "config": {...}, "device_type":str, "device_params":{...}}
+
+fp16_baseline_results.pt:
+  {"results": {mtype: {"history":[], "iters":N, "final_residual":F,
+   "rel_error":F, "converged":bool, "stop_reason":str, "total_matmuls":N,
+   "fp64_history":[], "fp64_iters":N,
+   "petra_costs":{"petra_nominal":{"total_energy_pJ":F, "total_latency_ns":F,
+   "total_energy_uJ":F, "total_latency_us":F, "area_mm2":F, ...},
+   "petra_efficient":{...}}}},
+   "petra_configs":{...}, "config":{...}}
+
+
+CODE FILES
+============
+Core solver:
+  solver.py              — MixedPrecisionSolver with pluggable matmul_fn
+  acim_matmul.py         — Standalone quantized matmul (no NeuroSim dependency)
+  test_matrices.py       — Haidar's 6 matrix types with GPU device support
+
+Experiments:
+  experiment_0.py        — Integer quantization viability sweep
+  experiment_1_2.py      — CIM convergence + PPA sweep with K averaging
+  experiment_fp16_baseline.py — FP16 baseline with PETRA cost model
+
+Sweep infrastructure:
+  sweep_config.json      — Full sweep parameters
+  sweep_config_quick.json — Quick sanity check config
+  split_config.py        — Splits config by (type,K) for parallel execution
+  run_sweep.sh           — Parallel sweep via xargs -P
+  merge_results.py       — Combines per-job .pt files
+  test_parallel.sh       — Parallel workflow test
+
+Analysis:
+  inspect_exp0.py        — Analyze experiment 0 results
+  plot_pareto.py         — Energy vs latency Pareto with configurable tol
+
+Device configs:
+  mem_states_rram.csv    — RRAM D2D variation (LRS/HRS mean and std)
+  mem_states_sram.csv    — SRAM (zero D2D variation)
+
+NeuroSim fix:
+  hook.py                — Fixed version (5 bugs)
+
+Documentation:
+  methodology_changes.txt — 19 items, all changes from proposal
+
+
+WORK SPLIT
+============
+Abhishek: Project idea, NeuroSim setup/debugging, quantization function,
+  CIM integration, all experiments, FP16 baseline, analysis, results
+  section, ACIM background section, conclusion.
+
+Denny: Solver algorithm (IRGM → GMRES), test matrix generator,
+  experiment 0 execution, paper writing (intro, background, methodology
+  sections), figures.
+
+
+PAPER OUTLINE
+==============
+Intro:
+  - Linear solvers in scientific computing
+  - Mixed-precision iterative refinement (high-level)
+  - Fig 1: high-level iterative refinement diagram
+  - ACIM for iterative refinement, problem statement, contributions
+  - Fig 2: convergence vs ACIM efficiency tension
+
+Background:
+  - Prior work on mixed-precision iterative refinement
+  - ACIM background (Abhishek)
+
+Iterative Refinement With ACIM:
+  - Algorithm details, which matmul goes to CIM, stationary vs streaming operand
+  - GMRES algorithm (LaTeX algorithmicx)
+
+Experimental Setup and Evaluation:
+  - ACIM simulation and configurations (Abhishek)
+  - Test matrices
+
+
+PENDING WORK
+==============
+- [x] Experiment 0 (quantization viability)
+- [x] Experiment 1-2 RRAM sweep (297 configs)
+- [x] Experiment 1-2 SRAM sweep (297 configs)
+- [ ] FP16 baseline experiment (run experiment_fp16_baseline.py)
+- [ ] Final Pareto plots comparing CIM vs PETRA baseline
+- [ ] Paper writing
+- [ ] Presentation preparation
+- [ ] Figures from Denny
+
+
+IMPORTANT TECHNICAL NOTES
+===========================
+1. FP32 inner loop doesn't work — Gram-Schmidt loses orthogonality at
+   cond=1e4. Must use FP64 for inner loop arithmetic.
+
+2. GPU (RTX 3080 Ti) is 1.76× faster than CPU at n=500 for FP64.
+   FP64 throughput on consumer GPUs is 1/32 of FP32.
+
+3. torch.randn produces different values on CUDA vs CPU with same seed.
+   All experiments run on GPU for consistency.
+
+4. NeuroSim's simulate_array has a shared reference column that creates
+   correlated noise across tiled weight copies. K-averaging must use
+   sequential forward passes, not tiling.
+
+5. Param.cpp memcelltype must be changed and recompiled for SRAM vs RRAM:
+   memcelltype=1 (SRAM), memcelltype=2 (RRAM).
+
+6. Matrix size < 128 causes C++ PPA backend to segfault ("SubArray Size
+   too large, which break the chip hierarchy").
+
+7. Convergence threshold is applied post-hoc from saved histories, not
+   during the solver run. The solver runs to max_outer=200 or divergence.

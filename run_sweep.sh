@@ -15,7 +15,7 @@
 #   bash run_sweep.sh rram 12 my.json   # custom config
 
 DEVICE=${1:-rram}
-NPROC=${2:-12}
+NPROC=${2:-24}
 CONFIG=${3:-sweep_config.json}
 
 echo "=== Generating job configs ==="
@@ -34,15 +34,24 @@ run_one() {
     LOG="results/log_${DEVICE}_${TAG}.txt"
     python experiment_1_2.py --device $DEVICE --config $CFG --suffix _${TAG} > $LOG 2>&1
     
+    # Atomic counter increment
+    flock results/.counter.lock bash -c 'N=$(cat results/.counter 2>/dev/null || echo 0); echo $((N+1)) > results/.counter; cat results/.counter'
+    DONE=$(cat results/.counter)
+
     PT="results/exp12_${DEVICE}_${TAG}_results.pt"
     if [ -f "$PT" ]; then
-        echo "  ✓ $TAG"
+        echo "  [$DONE/$NJOBS] ✓ $TAG"
     else
-        echo "  ✗ $TAG (check $LOG)"
+        echo "  [$DONE/$NJOBS] ✗ $TAG (check $LOG)"
     fi
 }
 export -f run_one
 export DEVICE
+export NJOBS
+
+# Reset counter
+echo 0 > results/.counter
+touch results/.counter.lock
 
 cat jobs/job_list.txt | xargs -P $NPROC -I {} bash -c 'run_one "{}"'
 
@@ -98,3 +107,6 @@ echo "Results: results/exp12_${DEVICE}_results.pt"
 echo "Per-job results: results/exp12_${DEVICE}_t*_results.pt"
 echo "Logs: results/log_${DEVICE}_*.txt"
 echo "Job configs: jobs/"
+
+# Clean counter files
+rm -f results/.counter results/.counter.lock

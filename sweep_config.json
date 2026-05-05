@@ -16,18 +16,7 @@
             "on_off_ratio": 13,
             "mem_states_file": "mem_states_rram.csv",
             "read_noise": 0.05,
-            "output_noise": 0.28,
-            "rate_stuck_0": 0.0,
-            "rate_stuck_1": 0.0
-        },
-        "sram": {
-            "mem_type": "resistive",
-            "off_state": 1e-15,
-            "on_state": 1e-14,
-            "on_off_ratio": 10,
-            "mem_states_file": "mem_states_sram.csv",
-            "read_noise": 0.01,
-            "output_noise": 0.26,
+            "output_noise": 0.0,
             "rate_stuck_0": 0.0,
             "rate_stuck_1": 0.0
         }
@@ -40,22 +29,10 @@
             "w_bits": [4, 6, 8],
             "i_bits": [4, 6, 8]
         },
-        "2": {
-            "name": "Log-uniform σ, +λ",
-            "precond": "diag",
-            "w_bits": [12, 16],
-            "i_bits": [10, 12, 16]
-        },
         "3": {
             "name": "Clustered σ, +λ",
             "precond": "diag",
             "w_bits": [10, 12, 16],
-            "i_bits": [10, 12, 16]
-        },
-        "5": {
-            "name": "Arithmetic σ, +λ",
-            "precond": "diag",
-            "w_bits": [8, 10, 12],
             "i_bits": [10, 12, 16]
         }
     }

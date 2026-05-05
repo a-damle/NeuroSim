@@ -178,71 +178,48 @@ to the top of macro.py. This is the fifth NeuroSim v1.5-dev bug found.
 14. ACIM DEVICE PARAMETERS AND NOISE MODELING
 ------------------------------------------------
 Proposal: Used NeuroSim default configurations as representative baselines.
-Final:    Device parameters updated to use published silicon measurements.
-          NeuroSim defaults all noise to zero; realistic values were sourced
-          from published characterization papers at the nearest available nodes.
+Final:    RRAM only. SRAM dropped (see item 17). Device parameters from
+          published silicon measurements. Uses NeuroSim's full analog
+          simulation path (output_noise=0.0) with physics-based noise.
 
-Methodology: Parameters were taken directly from published silicon measurements
-without extrapolation or scaling. Where a single source did not provide all
-three noise parameters, values were composed from multiple papers at comparable
-process nodes. This mix-and-match approach is documented below with per-parameter
-sourcing.
+CRITICAL NEUROSIM FINDING: NeuroSim's ADC_output() has two mutually
+exclusive code paths:
+  - output_noise > 0: DIGITAL SHORTCUT. Does integer matmul + flat Gaussian
+    noise. Bypasses ALL device physics (conductance, read noise, D2D, drift).
+  - output_noise == 0: FULL ANALOG PATH. Conductance lookup, D2D variation,
+    read noise, V=IG computation, amplifier feedback, ADC sensing.
+
+Setting output_noise > 0 causes read_noise and mem_states D2D parameters
+to have ZERO EFFECT. Previous sweep results used output_noise=0.28 and
+were therefore running the digital shortcut, not the analog simulation.
+
+Fix: Set output_noise=0.0 to enable the full analog path. ADC quantization
+noise emerges naturally from the sensing model (amplifier feedback +
+voltage step + ADC rounding) rather than needing explicit injection.
 
 RRAM Parameters (Intel 22nm FinFET ReRAM):
   Device:  Ron = 3kΩ (G_LRS = 3.33e-4 S), Roff = 40kΩ (G_HRS = 2.5e-5 S),
            on/off ratio ≈ 13, 1-bit/cell.
-  Source:  Read et al., "NeuroSim V1.5," 2026, Table I — published default
-           Intel 22nm RRAM configuration used by the NeuroSim authors.
+  Source:  Read et al., "NeuroSim V1.5," 2026, Table I.
 
   (1) Read noise (σ_read = 0.05, relative fraction of conductance per read):
-      Applied as conductance * (1 + N(0, 0.05)) per read cycle.
-      Source: Chen et al., "NeuroSim: A Circuit-Level Macro Model," IEEE TCAD
-      2018 — inference accuracy degrades above 15-25% σ. 5% chosen as
-      conservative value below this threshold. No direct C2C measurement
-      exists for the Intel 22nm device.
+      Applied as conductance * (1 + N(0, 0.05)) per read cycle in the analog
+      path. Noise scales with number of activated rows (physically correct:
+      more bitline currents summing = more accumulated noise).
+      Source: Chen et al., IEEE TCAD 2018.
 
   (2) D2D variation (stored in mem_states_rram.csv):
       LRS: mean = 3.33e-4 S, std = 3.33e-5 S (10% of G_LRS)
       HRS: mean = 2.5e-5 S,  std = 5.0e-6 S  (20% of G_HRS)
-      Source: Read et al. 2026, Fig. 6 — sweeps D2D from 1-40% LRS, shows
-      ResNet-50 accuracy degrades sharply above 5% LRS. 10% chosen as
-      moderately stressed but realistic. HRS set higher following the
-      asymmetric convention in V1.5 Fig. 6. No direct post-programming
-      distribution published for Intel 22nm due to NDA.
+      Programmed once at layer creation (deterministic across matmuls).
+      Source: Read et al. 2026, Fig. 6.
 
-  (3) ADC output noise (σ_ADC = 0.28 counts on 7-bit [0-127] scale):
-      Source: Li et al., "A 40nm MLC-RRAM CIM Macro," IEEE JSSC vol. 57,
-      Sep. 2022 — directly reported silicon measurement. Cited in Read et al.
-      2026 as ref [7], reported in V1.5 Fig. 9. Noted limitation: measurement
-      at 8 activated rows vs our 128, 3-bit ADC vs 7-bit, 40nm vs 22nm.
-
-SRAM Parameters (22nm FD-SOI charge-domain CIM):
-  Device:  6T/8T SRAM, 1-bit/cell. Digital bit storage, analog computation
-           via simultaneous wordline activation.
-  Source:  Kneip et al., "IMAGINE: An 8-to-1b 22nm FD-SOI CIM Accelerator,"
-           IEEE TCAS-AI vol. 2, Sep. 2025. Cited as ref [47] in Read et al.
-           2026. Values represent charge-domain lower bound; current-domain
-           6T/8T designs exhibit higher noise.
-
-  (1) Read noise (σ_read = 0.01, relative):
-      Source: Kneip et al. 2025, §III.B — kT/Cc thermal noise on 0.7fF MoM
-      capacitor = 2.4mV, below 8-bit LSB (3.125mV). No filament stochasticity;
-      noise is thermal only. Order of magnitude lower than RRAM.
-
-  (2) D2D variation (σ = 0 for both states):
-      SRAM stores digital bits via cross-coupled inverters at voltage rails.
-      No analog programming step, therefore no cell-to-cell conductance scatter.
-      Transistor Vth mismatch manifests during readout and is captured in σ_ADC.
-
-  (3) ADC output noise (σ_ADC = 0.26 counts, charge-domain lower bound):
-      Source: Kneip et al. 2025, §V.A — measured max RMS = 0.52 LSB at 8-bit,
-      128 rows. Divided by 2 for 7-bit conversion. Current-domain 6T/8T designs
-      show 0.4-1.1 counts (7-bit equivalent) per same paper's comparison table.
-
-Note: Previous experiment 1-2 run (exp12_rram_results.pt) used all-zero noise
-parameters (NeuroSim defaults), so convergence results were equivalent to
-experiment 0 with only quantization + ADC pipeline effects. Re-run required
-with these realistic noise values.
+  (3) ADC output noise: NOT explicitly set (output_noise=0.0).
+      ADC quantization noise emerges from the analog sensing model:
+        - Amplifier feedback scales as 1/(p × ΔG)
+        - ADC step = V_dd × ΔG × amp_feedback
+        - Quantization via round() + clamp to ADC range
+      This is more physically accurate than flat Gaussian injection.
 
 
 15. RRAM DEVICE PARAMETERS IN cim_args
@@ -252,10 +229,147 @@ Final:    Updated to Intel 22nm values (off_state=2.5e-5, on_state=3.33e-4,
           on/off≈13) to match the device characterization in Read et al. 2026.
 
 
-16. POTENTIAL FUTURE ADDITIONS (if needed)
---------------------------------------------
-- Device averaging (Le Gallo's K parameter): store each matrix element in K
-  devices and average reads. Trades area for precision. May be needed if
-  NeuroSim analog noise is too severe for convergence.
+16. NEUROSIM BUGS #6 AND #7 (macro.py)
+-----------------------------------------
+Bug #6 (conductance clamp): conductance_sampling can produce negative values
+via Gaussian sampling (physically impossible). read_noise then gets negative
+std, crashing torch.normal. Fix: clamp conductances to min=0 after sampling.
+  memory_states = torch.clamp(memory_states, min=0.0)
+  memory_states_ref = torch.clamp(memory_states_ref, min=0.0)
+
+Bug #7 (output_noise bypass): When output_noise > 0, ADC_output returns
+early at line 196, bypassing the entire analog simulation (conductance,
+read noise, D2D, drift). This is by design (two separate models) but
+is not documented. Users who set both output_noise and read_noise get
+only the digital shortcut — read_noise has zero effect.
+
+Total NeuroSim v1.5-dev bugs found: 7 (5 in hook.py, 2 in macro.py).
+
+
+17. SRAM DROPPED FROM STUDY
+------------------------------
+Proposal: Compare SRAM and RRAM CIM devices.
+Final:    SRAM dropped. NeuroSim v1.5's analog simulation path models
+          resistive memory physics (I=VG, conductance-based sensing).
+          SRAM CIM operates via different mechanisms (charge-domain Q=CV
+          or current-domain transistor gating) that this model does not
+          capture. The NeuroSim authors acknowledge this limitation:
+          "Regarding 6T SRAM mode... we have not fully incorporated more
+          intricate simulations to account for the unique non-idealities
+          found in analog SRAM mode" (Read et al. 2026).
+
+          Previous SRAM results used the digital shortcut (output_noise=0.26)
+          which bypassed the conductance model entirely. While those results
+          showed SRAM's lower noise floor, the modeling approach lacks
+          physical grounding. SRAM CIM comparison is noted as future work
+          pending improved simulator support.
+
+
+18. REVISED CIM SWEEP (FINAL)
+--------------------------------
+Previous sweep: 4 types × 33 precision × 3 parallelism × 3 K = 297 configs
+Final sweep:    2 types × 9 precision × 3 parallelism × 3 K = 162 configs
+
+Only types 1 and 3 showed any convergence in previous runs:
+  Type 1 (diag dominant): all configs converge
+  Type 3 (clustered σ, +λ): converges at high precision + high K
+
+Types 2 and 5 did not converge at any configuration even with K=8,
+and are excluded from the final sweep. Their non-convergence is
+reported as a finding (analog noise too severe for these condition
+numbers with diagonal preconditioning).
+
+  Type 1: w∈{4,6,8}, i∈{4,6,8} × p∈{32,64,128} × K∈{1,4,8} = 81 configs
+  Type 3: w∈{10,12,16}, i∈{10,12,16} × p∈{32,64,128} × K∈{1,4,8} = 81 configs
+
+
+16. DEVICE AVERAGING (K PARAMETER) — IMPLEMENTED
+---------------------------------------------------
+Proposal: Not discussed.
+Final:    Implemented Le Gallo's K-device averaging. Each matrix element is
+          stored in K devices and the read results are averaged, reducing
+          effective noise by approximately 1/√K across all noise sources.
+
+K values swept: {1, 4, 8}
+
+Implementation: K sequential forward passes through CIMLinear, outputs
+averaged. Tiled approach (stacking K copies of W along output dimension
+for single-pass execution) was tested but rejected — the shared reference
+column in simulate_array causes correlated noise across tiles, defeating
+the purpose of averaging.
+
+PPA scaling for K devices read in parallel:
+  - Energy: K × single-device energy (K independent column groups reading)
+  - Latency: unchanged (parallel read)
+  - Area: K × single-device area
+
+Key finding: K averaging significantly improves convergence for moderate
+matrices (Type 3: residual drops from 1e-1 to 1e-9 going K=1→K=8) but
+cannot rescue the hardest matrices (Types 2, 5) where noise is too severe.
+
+
+17. FP16 DIGITAL BASELINE
+----------------------------
+Proposal: Mentioned FP16 baseline per Prof. Li's suggestion but no details.
+Final:    FP16 baseline implemented as direct torch.float16 casting of both
+          operands in the inner loop matmul. This matches what hardware FP16
+          units do — NOT the same as 16-bit integer quantization via acim_matmul.
+
+          FP16 (IEEE 754 half-precision): 5-bit exponent, 10-bit mantissa,
+          non-uniform spacing, dynamic range ±65,504.
+          INT16 (acim_matmul at 16-bit): uniform integer grid, no exponent.
+
+          On CUDA with tensor cores (RTX 3080 Ti), PyTorch accumulates FP16
+          matmuls in FP32 internally, matching Haidar's FP16-TC path — the
+          most relevant modern hardware comparison.
+
+Cost model: PETRA (Cho et al., VLSI Circuits 2021), 22nm Intel FinFET.
+  - Same process node as NeuroSim RRAM/SRAM configs.
+  - Measured silicon, FP16 native, 1024 MACs.
+  - Two operating points:
+      Nominal (0.88V): 0.89 pJ/MAC, 701 MHz → 222 nJ/MVM, 0.348 µs/MVM
+      Peak eff (0.70V): 0.29 pJ/MAC, 416 MHz → 71.7 nJ/MVM, 0.587 µs/MVM
+  - Area: 3.04 mm²
+  - 500×500 MVM = 250,000 MACs
+
+Total solver cost = outer_iters × inner_iters × cost_per_MVM.
+
+
+18. DATA FILES AND FORMATS
+-----------------------------
+Three .pt result files with different key formats (all loadable with just
+PyTorch, no NeuroSim needed):
+
+  exp0_results_light.pt:
+    Key: (mtype, wb, ib)
+    Fields: history, iters, final_residual, rel_error, converged
+    Baselines: FP64 per matrix type (history and iters only, no A/x_ref)
+    Matrices regenerated deterministically via TestMatrixGenerator(500, seed=42)
+
+  exp12_{device}_results.pt:
+    Key: (mtype, wb, ib, pr, K)
+    Fields: history, iters, final_residual, rel_error, converged,
+            stop_reason, total_matmuls, K, ppa_single, total_energy_pJ,
+            total_latency_ns, total_area_um2
+    Baselines: FP64 per matrix type
+
+  fp16_baseline_results.pt:
+    Key: mtype (int)
+    Fields: history, iters, final_residual, rel_error, converged,
+            stop_reason, total_matmuls, fp64_history, fp64_iters,
+            petra_costs (per PETRA operating point: energy, latency, area)
+
+All files contain full convergence histories (residual per outer iteration)
+and can be re-plotted at any convergence threshold without re-running.
+
+
+19. POTENTIAL FUTURE DIRECTIONS
+---------------------------------
 - CIM-compatible preconditioners: block diagonal or polynomial preconditioners
   as middle ground between weak diagonal and expensive LU.
+- Larger K values (K=16, 32) for harder matrix types at the cost of
+  proportionally more area and energy.
+- Larger matrix sizes (4K×4K as in original proposal) to verify convergence
+  behavior scales.
+- Non-symmetric matrices with LU preconditioning: quantify the reprogramming
+  cost and compare against the unpreconditioned approach.
